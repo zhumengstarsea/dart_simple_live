@@ -1,0 +1,456 @@
+name: 发版
+
+# 推 v* tag 发 App 版，推 tv_* tag 发 TV 版，各自发布对应的 GitHub Release。
+# 原来的 publish_app_release.yml 与 publish_tv_app_release.yaml 合并到这里。
+#
+# 说明：
+# - 不写死 checkout 的 ref，推哪个 tag 就签出哪个 tag（原来是写死 master）。
+# - App 版版本号取自 tag 名；TV 版版本号取自 assets/tv_app_version.json。
+# - 只跑对应那一侧：v* 只编 App 版，tv_* 只编 TV 版。
+#
+# 关于日志语言：步骤名、进度输出、失败提示都是中文。
+# 但 flutter / Gradle / CMake / MSBuild 自己抛的报错是英文硬编码的，改不了；
+# GitHub 自己的提示（Node.js 弃用、Process completed with exit code 1）同样改不了。
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "tv_*"
+
+jobs:
+  # ============================================================ App 版
+  # ------------------------------------------------- macOS / iOS / Android
+  app-macos-ios-android:
+    name: App 版 macOS / iOS / Android
+    if: ${{ !startsWith(github.ref_name, 'tv_') }}
+    # macos-15-intel 默认只带 Xcode 16.4，而 device_info_plus 12.4.0 用了
+    # iOS 26.1 SDK 新增的 isiOSAppOnVision，Xcode 太旧会编译失败。
+    # 固定到 macos-15-intel 并显式切到它已安装的 Xcode 26.3（同上游 1.11.5+ 的发布流程）。
+    runs-on: macos-15-intel
+    permissions:
+      contents: write
+    env:
+      XCODE_VERSION: "26.3"
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 选择 Xcode
+        run: sudo xcode-select --switch "/Applications/Xcode_${{ env.XCODE_VERSION }}.app/Contents/Developer"
+
+      - name: 签名状态
+        # 没有配置签名密钥不再直接失败，而是回退到 debug 签名继续出包。
+        # 原来报的是 “encodedString 值未设置”（base64-to-file 的必填输入是空的），
+        # 那个提示看不出所以然，这里改成把缺了哪些 secret 讲清楚。
+        run: |
+          missing=""
+          if [ -z "$KEYSTORE_BASE64" ]; then missing="$missing KEYSTORE_BASE64"; fi
+          if [ -z "$STORE_PASSWORD" ]; then missing="$missing STORE_PASSWORD"; fi
+          if [ -z "$KEY_PASSWORD" ]; then missing="$missing KEY_PASSWORD"; fi
+          if [ -z "$KEY_ALIAS" ]; then missing="$missing KEY_ALIAS"; fi
+          if [ -n "$missing" ]; then
+            echo "::warning title=回退到 debug 签名::没有配置这些 secret：$missing（fork 不会继承上游仓库的 secret）。本次 APK 改用 debug 密钥签名 —— 代码仍是 release 优化版，能正常安装使用，但装不上已装的正式签名版本（需先卸载），以后换密钥同样要先卸载。想用正式签名：Settings → Secrets and variables → Actions 补齐这四个即可。"
+          else
+            echo "===== 使用正式签名 ====="
+          fi
+
+      - name: 下载 Android 签名密钥
+        id: android_keystore
+        if: ${{ env.KEYSTORE_BASE64 != '' && env.STORE_PASSWORD != '' && env.KEY_PASSWORD != '' && env.KEY_ALIAS != '' }}
+        uses: timheuer/base64-to-file@v2
+        with:
+          fileName: keystore.jks
+          encodedString: ${{ secrets.KEYSTORE_BASE64 }}
+
+      - name: 生成 key.properties
+        if: ${{ env.KEYSTORE_BASE64 != '' && env.STORE_PASSWORD != '' && env.KEY_PASSWORD != '' && env.KEY_ALIAS != '' }}
+        run: |
+          echo "===== 写入签名配置 simple_live_app/android/key.properties ====="
+          echo "storeFile=${{ steps.android_keystore.outputs.filePath }}" > simple_live_app/android/key.properties
+          echo "storePassword=${{ secrets.STORE_PASSWORD }}" >> simple_live_app/android/key.properties
+          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> simple_live_app/android/key.properties
+          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> simple_live_app/android/key.properties
+          echo "===== 完成 ====="
+
+      - name: 设置 Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: "zulu"
+          java-version: "17"
+          cache: "gradle"
+
+      - name: 设置 Flutter 3.47.1
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.1"
+          cache: true
+
+      - name: 启用 macOS 桌面支持
+        run: flutter config --enable-macos-desktop
+
+      - name: 拉取依赖
+        run: |
+          echo "===== 开始：拉取依赖 ====="
+          cd simple_live_app
+          flutter pub get
+          echo "===== 完成 ====="
+
+      - name: 安装 appdmg
+        run: |
+          echo "===== 开始：安装 appdmg（打 dmg 用）====="
+          npm install -g appdmg
+          echo "===== 完成 ====="
+
+      - name: 安装 flutter_distributor
+        run: |
+          echo "===== 开始：安装打包工具 flutter_distributor ====="
+          dart pub global activate flutter_distributor
+          echo "===== 完成 ====="
+
+      - name: 打包 APK
+        run: |
+          echo "===== 开始：打包 APK（按 ABI 拆分）====="
+          cd simple_live_app
+          flutter build apk --release --split-per-abi
+          echo "===== 完成 ====="
+
+      - name: 上传 APK 到 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: |
+            simple_live_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+            simple_live_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            simple_live_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
+
+      - name: 打包 IPA
+        run: |
+          echo "===== 开始：编译 iOS（不签名）====="
+          cd simple_live_app
+          flutter build ios --release --no-codesign
+          echo "===== 完成 ====="
+
+      - name: 生成未签名 IPA
+        run: |
+          echo "===== 开始：把 Runner.app 打成 ios_no_sign.ipa ====="
+          cd simple_live_app
+          mkdir -p build/ios/iphoneos/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/Runner.app
+          cd build/ios/iphoneos
+          zip -q -r ios_no_sign.ipa Payload
+          echo "===== 完成 ====="
+
+      - name: 上传 IPA 到 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios
+          path: simple_live_app/build/ios/iphoneos/ios_no_sign.ipa
+
+      - name: 打包 macOS
+        run: |
+          echo "===== 开始：打包 macOS（dmg / zip）====="
+          cd simple_live_app
+          flutter_distributor package --platform macos --targets dmg,zip --skip-clean
+          echo "===== 完成 ====="
+
+      - name: 上传 macOS 到 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac
+          path: |
+            simple_live_app/build/dist/*/*.dmg
+            simple_live_app/build/dist/*/*.zip
+
+      - name: 读取版本号（从 Tag）
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: 输出版本号
+        run: echo "本次发布版本号：${{ steps.version.outputs.VERSION }}"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "${{ steps.version.outputs.VERSION }}"
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          token: ${{ secrets.TOKEN }}
+          files: |
+            simple_live_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
+            simple_live_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            simple_live_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+            simple_live_app/build/ios/iphoneos/ios_no_sign.ipa
+            simple_live_app/build/dist/*/*.dmg
+            simple_live_app/build/dist/*/*.zip
+
+      - name: 失败提示
+        if: failure()
+        run: |
+          echo "::error title=App 版发版失败::往上翻第一条红色报错。按顺序排查：Android 签名密钥(secret) -> Xcode/CocoaPods -> appdmg/flutter_distributor -> 发布 Release 用的 TOKEN 权限。"
+
+  # ------------------------------------------------------------ App 版 Linux
+  app-linux:
+    name: App 版 Linux
+    if: ${{ !startsWith(github.ref_name, 'tv_') }}
+    # 原来的 ubuntu-22.04 在逐步退役，上游 1.11.7 已改用 ubuntu-24.04
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 设置 Flutter 3.47.1
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.1"
+          cache: true
+
+      - name: 更新 apt 源
+        run: |
+          echo "===== 开始：更新 apt 源 ====="
+          sudo apt-get update
+          echo "===== 完成 ====="
+
+      - name: 安装系统依赖
+        run: |
+          echo "===== 开始：安装编译依赖 ====="
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libasound2-dev libmpv-dev mpv
+          echo "===== 完成 ====="
+
+      - name: 启用 Linux 桌面支持
+        run: flutter config --enable-linux-desktop
+
+      - name: 拉取依赖
+        run: |
+          echo "===== 开始：拉取依赖 ====="
+          cd simple_live_app
+          flutter pub get
+          echo "===== 完成 ====="
+
+      - name: 安装 flutter_distributor
+        run: |
+          echo "===== 开始：安装打包工具 flutter_distributor ====="
+          dart pub global activate flutter_distributor
+          echo "===== 完成 ====="
+
+      - name: 打包 Linux
+        run: |
+          echo "===== 开始：打包 Linux（deb / zip）====="
+          cd simple_live_app
+          flutter_distributor package --platform linux --targets deb,zip --skip-clean
+          echo "===== 完成 ====="
+
+      - name: 上传 Linux 包到 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: |
+            simple_live_app/build/dist/*/*.deb
+            simple_live_app/build/dist/*/*.zip
+
+      - name: 读取版本号（从 Tag）
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: 输出版本号
+        run: echo "本次发布版本号：${{ steps.version.outputs.VERSION }}"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "${{ steps.version.outputs.VERSION }}"
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          token: ${{ secrets.TOKEN }}
+          files: |
+            simple_live_app/build/dist/*/*.deb
+            simple_live_app/build/dist/*/*.zip
+
+      - name: 失败提示
+        if: failure()
+        run: |
+          echo "::error title=App 版 Linux 发版失败::往上翻第一条红色报错。最常见是 apt 依赖没装上，或发布 Release 用的 TOKEN 权限不足。"
+
+  # ---------------------------------------------------------- App 版 Windows
+  app-windows:
+    name: App 版 Windows
+    if: ${{ !startsWith(github.ref_name, 'tv_') }}
+    # 固定 windows-2022，原因同 build.yml（windows-latest 已是 VS 18 / MSVC 14.51）
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      # 与 App 版其他平台统一用 3.47.1：理由见 build.yml 里的说明
+      # （dev 的代码依赖 onReorderItem，需要 Flutter 3.41+）
+      - name: 设置 Flutter 3.47.1
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.1"
+          cache: true
+
+      - name: 启用 Windows 桌面支持
+        run: flutter config --enable-windows-desktop
+
+      - name: 拉取依赖并打包
+        # pwsh 不会因为原生命令失败就中断，所以每条命令后都显式检查退出码。
+        run: |
+          $ErrorActionPreference = 'Stop'
+          echo "===== 开始：拉取依赖 ====="
+          cd simple_live_app
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { throw "拉取依赖失败（退出码 $LASTEXITCODE）" }
+          echo "===== 开始：安装打包工具 flutter_distributor ====="
+          dart pub global activate flutter_distributor
+          if ($LASTEXITCODE -ne 0) { throw "安装 flutter_distributor 失败（退出码 $LASTEXITCODE）" }
+          echo "===== 开始：打包 Windows（msix / zip）====="
+          flutter_distributor package --platform windows --targets msix,zip --skip-clean
+          if ($LASTEXITCODE -ne 0) { throw "打包失败（退出码 $LASTEXITCODE）" }
+          echo "===== 完成 ====="
+
+      - name: 上传 Windows 包到 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: |
+            simple_live_app/build/dist/*/*.msix
+            simple_live_app/build/dist/*/*.zip
+
+      - name: 读取版本号（从 Tag）
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: 输出版本号
+        run: echo "本次发布版本号：${{ steps.version.outputs.VERSION }}"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "${{ steps.version.outputs.VERSION }}"
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
+          token: ${{ secrets.TOKEN }}
+          files: |
+            simple_live_app/build/dist/*/*.msix
+            simple_live_app/build/dist/*/*.zip
+
+      - name: 失败提示
+        if: failure()
+        run: |
+          echo "::error title=App 版 Windows 发版失败::往上翻第一条红色报错。常见是 Windows 桌面工具链(Visual Studio)、flutter_distributor 配置，或发布 Release 用的 TOKEN 权限。"
+
+  # ============================================================ TV 版
+  tv-android:
+    name: TV 版 Android
+    if: ${{ startsWith(github.ref_name, 'tv_') }}
+    # 只编 Android，用 ubuntu 就够（原来跟着手机端写在 macos-latest 上，
+    # 纯属浪费 macOS 机时；构建 workflow 里的 TV Android 也一直是 ubuntu）。
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TV_KEYSTORE_BASE64: ${{ secrets.TV_KEYSTORE_BASE64 }}
+      TV_STORE_PASSWORD: ${{ secrets.TV_STORE_PASSWORD }}
+      TV_KEY_PASSWORD: ${{ secrets.TV_KEY_PASSWORD }}
+      TV_KEY_ALIAS: ${{ secrets.TV_KEY_ALIAS }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 签名状态
+        # 同 App 版：没配密钥不直接失败，回退 debug 签名继续出包。
+        run: |
+          missing=""
+          if [ -z "$TV_KEYSTORE_BASE64" ]; then missing="$missing TV_KEYSTORE_BASE64"; fi
+          if [ -z "$TV_STORE_PASSWORD" ]; then missing="$missing TV_STORE_PASSWORD"; fi
+          if [ -z "$TV_KEY_PASSWORD" ]; then missing="$missing TV_KEY_PASSWORD"; fi
+          if [ -z "$TV_KEY_ALIAS" ]; then missing="$missing TV_KEY_ALIAS"; fi
+          if [ -n "$missing" ]; then
+            echo "::warning title=回退到 debug 签名::没有配置这些 secret：$missing（fork 不会继承上游仓库的 secret）。本次 TV 版 APK 改用 debug 密钥签名 —— 代码仍是 release 优化版，能正常安装使用，但装不上已装的正式签名版本（需先卸载），以后换密钥同样要先卸载。想用正式签名：Settings → Secrets and variables → Actions 补齐这四个即可。"
+          else
+            echo "===== 使用正式签名 ====="
+          fi
+
+      - name: 下载 TV 版签名密钥
+        id: tv_keystore
+        if: ${{ env.TV_KEYSTORE_BASE64 != '' && env.TV_STORE_PASSWORD != '' && env.TV_KEY_PASSWORD != '' && env.TV_KEY_ALIAS != '' }}
+        uses: timheuer/base64-to-file@v2
+        with:
+          fileName: keystore.jks
+          encodedString: ${{ secrets.TV_KEYSTORE_BASE64 }}
+
+      - name: 生成 key.properties
+        if: ${{ env.TV_KEYSTORE_BASE64 != '' && env.TV_STORE_PASSWORD != '' && env.TV_KEY_PASSWORD != '' && env.TV_KEY_ALIAS != '' }}
+        run: |
+          echo "===== 写入签名配置 simple_live_tv_app/android/key.properties ====="
+          echo "storeFile=${{ steps.tv_keystore.outputs.filePath }}" > simple_live_tv_app/android/key.properties
+          echo "storePassword=${{ secrets.TV_STORE_PASSWORD }}" >> simple_live_tv_app/android/key.properties
+          echo "keyPassword=${{ secrets.TV_KEY_PASSWORD }}" >> simple_live_tv_app/android/key.properties
+          echo "keyAlias=${{ secrets.TV_KEY_ALIAS }}" >> simple_live_tv_app/android/key.properties
+          echo "===== 完成 ====="
+
+      - name: 设置 Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: "zulu"
+          java-version: "17"
+          cache: "gradle"
+
+      # TV 版与 App 版统一用 Flutter 3.47.1，与 simple_live_tv_app/.fvmrc(3.47.1) 一致
+      - name: 设置 Flutter 3.47.1
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.1"
+          cache: true
+
+      - name: 拉取依赖
+        run: |
+          echo "===== 开始：拉取依赖 ====="
+          cd simple_live_tv_app
+          flutter pub get
+          echo "===== 完成 ====="
+
+      - name: 打包 APK
+        run: |
+          echo "===== 开始：打包 TV 版 APK（按 ABI 拆分）====="
+          cd simple_live_tv_app
+          flutter build apk --release --split-per-abi
+          echo "===== 完成 ====="
+
+      - name: 上传 APK 到 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: android_tv
+          path: |
+            simple_live_tv_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+            simple_live_tv_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            simple_live_tv_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
+
+      - name: 读取版本号
+        id: version
+        uses: juliangruber/read-file-action@v1
+        with:
+          path: assets/tv_app_version.json
+      - name: 输出版本号
+        run: echo "本次发布版本号：${{ fromJson(steps.version.outputs.content).version }}"
+      - name: 输出版本说明
+        run: echo "版本说明：${{ fromJson(steps.version.outputs.content).version_desc }}"
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "${{ fromJson(steps.version.outputs.content).version }}"
+          body: "# Android TV \n${{ fromJson(steps.version.outputs.content).version_desc }}"
+          prerelease: ${{ fromJson(steps.version.outputs.content).prerelease }}
+          token: ${{ secrets.TOKEN }}
+          files: |
+            simple_live_tv_app/build/app/outputs/flutter-apk/app-x86_64-release.apk
+            simple_live_tv_app/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            simple_live_tv_app/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+
+      - name: 失败提示
+        if: failure()
+        run: |
+          echo "::error title=TV 版发版失败::往上翻第一条红色报错。按顺序排查：TV 签名密钥(secret TV_*) -> assets/tv_app_version.json 格式 -> 发布 Release 用的 TOKEN 权限。"

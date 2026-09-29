@@ -198,6 +198,9 @@ class DouyinDanmaku implements LiveDanmaku {
   Future stop() async {
     onMessage = null;
     onClose = null;
+    // onReady 也要置空：连接在 stop() 之后才完成时会回调它，
+    // 从而在已销毁的直播间控制器上继续执行
+    onReady = null;
     webScoketUtils?.close();
   }
 }

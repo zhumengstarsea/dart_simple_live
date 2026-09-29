@@ -17,6 +17,7 @@ import 'package:simple_live_app/app/controller/app_settings_controller.dart';
 import 'package:simple_live_app/app/log.dart';
 import 'package:simple_live_app/app/utils.dart';
 import 'package:simple_live_app/app/utils/listen_fourth_button.dart';
+import 'package:simple_live_app/app/window_state.dart';
 import 'package:simple_live_app/models/db/follow_user.dart';
 import 'package:simple_live_app/models/db/follow_user_tag.dart';
 import 'package:simple_live_app/models/db/history.dart';
@@ -166,6 +167,44 @@ void initCoreLog() {
   };
 }
 
+/// 全局键盘监听节点。
+/// 原来写成 `focusNode: FocusNode()`，位于 app 级 builder 内部，
+/// 每次重建（全屏/小窗切换、窗口尺寸变化都会重建）都会新建一个 FocusNode 且从不释放，
+/// 会不断堆积在焦点树里。
+final FocusNode globalKeyListenerFocusNode = FocusNode();
+
+/// 侧键返回是否正在处理中。
+/// 侧键是全局手势，连续点击会并发进入处理函数；原来两次点击会各自执行
+/// 一次 Get.back()，第二次会把直播间后面的页面也弹掉（出现空白/卡住）。
+bool _handlingGlobalBackAction = false;
+
+/// 全局返回（鼠标侧键）。
+/// 只负责退出系统全屏；直播间内的全屏/小窗切换由页面自己的
+/// PopScope 与返回箭头处理，这里不再重复介入。
+Future<void> handleGlobalBackAction() async {
+  if (_handlingGlobalBackAction) {
+    return;
+  }
+  _handlingGlobalBackAction = true;
+  try {
+    if (!Platform.isAndroid && !Platform.isIOS && AppWindowState.isFullScreen) {
+      // 读 Dart 侧记录的状态，不再调用 windowManager.isFullScreen()：
+      // 那是跨到引擎窗口管理器的方法通道调用，Windows 上在返回这种高频路径里
+      // 会偶发让进程直接崩溃（崩溃点早于 Get.back()，日志里看不到路由关闭）。
+      AppWindowState.markFullScreen(false);
+      await windowManager.setFullScreen(false);
+      return;
+    }
+    Get.back();
+  } catch (e) {
+    Log.logPrint("返回操作失败：$e");
+  } finally {
+    // 短暂去抖，避免一次连击被当成多次返回
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    _handlingGlobalBackAction = false;
+  }
+}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -229,31 +268,25 @@ class MyApp extends StatelessWidget {
                             FourthButtonTapGestureRecognizer>(
                       () => FourthButtonTapGestureRecognizer(),
                       (FourthButtonTapGestureRecognizer instance) {
-                        instance.onTapDown = (TapDownDetails details) async {
-                          //如果处于全屏状态，退出全屏
-                          if (!Platform.isAndroid && !Platform.isIOS) {
-                            if (await windowManager.isFullScreen()) {
-                              await windowManager.setFullScreen(false);
-                              return;
-                            }
-                          }
-                          Get.back();
+                        instance.onTapDown = (TapDownDetails details) {
+                          handleGlobalBackAction();
                         };
                       },
                     ),
                   },
                   child: KeyboardListener(
-                    focusNode: FocusNode(),
+                    focusNode: globalKeyListenerFocusNode,
                     onKeyEvent: (KeyEvent event) async {
                       if (event is KeyDownEvent &&
                           event.logicalKey == LogicalKeyboardKey.escape) {
                         // ESC退出全屏
-                        // 如果处于全屏状态，退出全屏
-                        if (!Platform.isAndroid && !Platform.isIOS) {
-                          if (await windowManager.isFullScreen()) {
-                            await windowManager.setFullScreen(false);
-                            return;
-                          }
+                        // 同样只读 Dart 侧状态，不向窗口管理器查询
+                        if (!Platform.isAndroid &&
+                            !Platform.isIOS &&
+                            AppWindowState.isFullScreen) {
+                          AppWindowState.markFullScreen(false);
+                          await windowManager.setFullScreen(false);
+                          return;
                         }
                       }
                     },

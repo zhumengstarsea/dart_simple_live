@@ -53,6 +53,17 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 add_subdirectory("runner")
 
 
+# MSVC 14.5x（Visual Studio 18，windows-latest 现在已经换成它）把
+# <experimental/coroutine> 与 /await 标记为即将移除，一遇到就直接编译失败：
+#   error C2338: static assertion failed: 'error STL1011: The /await compiler option,
+#   <experimental/coroutine>, ... are deprecated by Microsoft and will be REMOVED SOON.
+#   ... You can define _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS to
+#   suppress this error for now.'
+# flutter_inappwebview_windows、permission_handler_windows 等插件仍在用它，
+# 所以按编译器的提示定义这个宏。放在 generated_plugins.cmake 之前，
+# 这样所有插件子目录都能继承到。
+add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)

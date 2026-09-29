@@ -107,6 +107,18 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
   var liveDuration = "00:00:00".obs;
   Timer? _liveDurationTimer;
 
+  /// 控制器是否已销毁。
+  /// loadData() 是 fire-and-forget 的异步方法，点击返回时它可能还在 await 中；
+  /// 原来 await 之后的代码会继续在已销毁的控制器上执行，重新启动开播时长定时器
+  /// （每秒回调一次、永不停止）并建立新的弹幕 WebSocket，而 onClose() 已经跑完，
+  /// 再也无法取消它们。
+  bool _disposed = false;
+
+  /// 定时关闭到点后等待用户确认的兜底计时器。
+  /// 原来它被赋值给回调的局部参数 timer，外部拿不到引用，onClose() 也就无法取消，
+  /// 于是离开直播间之后仍可能被它执行 exit(0)。
+  Timer? _autoExitDelayTimer;
+
   @override
   void onInit() {
     WidgetsBinding.instance.addObserver(this);
@@ -152,24 +164,34 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
     countdown.value = autoExitMinutes.value * 60;
     autoExitTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
       countdown.value -= 1;
-      if (countdown.value <= 0) {
-        timer = Timer(const Duration(seconds: 10), () async {
-          await WakelockPlus.disable();
-          exit(0);
-        });
-        autoExitTimer?.cancel();
-        var delay = await Utils.showAlertDialog("定时关闭已到时,是否延迟关闭?",
-            title: "延迟关闭", confirm: "延迟", cancel: "关闭", selectable: true);
-        if (delay) {
-          timer.cancel();
-          delayAutoExit.value = true;
-          showAutoExitSheet();
-          setAutoExit();
-        } else {
-          delayAutoExit.value = false;
-          await WakelockPlus.disable();
-          exit(0);
+      if (countdown.value > 0) {
+        return;
+      }
+      timer.cancel();
+      autoExitTimer?.cancel();
+      // 兜底计时器保存为字段，保证 onClose() 与下面的分支都能取消它
+      _autoExitDelayTimer?.cancel();
+      _autoExitDelayTimer = Timer(const Duration(seconds: 10), () async {
+        if (_disposed) {
+          return;
         }
+        await WakelockPlus.disable();
+        exit(0);
+      });
+      var delay = await Utils.showAlertDialog("定时关闭已到时,是否延迟关闭?",
+          title: "延迟关闭", confirm: "延迟", cancel: "关闭", selectable: true);
+      _autoExitDelayTimer?.cancel();
+      if (_disposed) {
+        return;
+      }
+      if (delay) {
+        delayAutoExit.value = true;
+        showAutoExitSheet();
+        setAutoExit();
+      } else {
+        delayAutoExit.value = false;
+        await WakelockPlus.disable();
+        exit(0);
       }
     });
   }
@@ -287,6 +309,11 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
       addSysMsg("正在读取直播间信息");
       detail.value = await site.liveSite.getRoomDetail(roomId: roomId);
 
+      // 请求期间页面可能已经被关闭，此时不能再继续操作已销毁的控制器
+      if (_disposed) {
+        return;
+      }
+
       if (site.id == Constant.kDouyin) {
         // 1.6.0之前收藏的WebRid
         // 1.6.0收藏的RoomID
@@ -328,6 +355,11 @@ class LiveRoomController extends PlayerController with WidgetsBindingObserver {
         addSysMsg("当前主播未开播，正在轮播录像");
       }
       addSysMsg("开始连接弹幕服务器");
+      // onClose() 已经执行完毕，这里再创建的定时器与 WebSocket 将永远无法取消，
+      // 会持续存活到进程结束（每秒一次的回调 + 一条常驻连接）
+      if (_disposed) {
+        return;
+      }
       initDanmau();
       liveDanmaku.start(detail.value?.danmakuData);
       startLiveDurationTimer(); // 启动开播时长定时器
@@ -1022,6 +1054,10 @@ ${error?.stackTrace}''');
 
   // 用于启动开播时长计算和更新的函数
   void startLiveDurationTimer() {
+    // 已销毁时不再启动：这样创建出来的定时器没有任何人能取消
+    if (_disposed) {
+      return;
+    }
     // 如果不是直播状态或者 showTime 为空，则不启动定时器
     if (!(detail.value?.status ?? false) || detail.value?.showTime == null) {
       liveDuration.value = "00:00:00"; // 未开播时显示 00:00:00
@@ -1053,13 +1089,19 @@ ${error?.stackTrace}''');
 
   @override
   void onClose() {
+    // 立刻置位，阻止仍在 await 中的 loadData() 等异步流程继续创建定时器与连接
+    _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     scrollController.removeListener(scrollListener);
     autoExitTimer?.cancel();
+    // 定时关闭的兜底计时器：不取消的话，离开直播间之后它仍可能执行 exit(0)
+    _autoExitDelayTimer?.cancel();
 
     liveDanmaku.stop();
-    danmakuController = null;
     _liveDurationTimer?.cancel(); // 页面关闭时取消定时器
+    // 先让 PlayerController 清理弹幕控制器（clear() 依赖 danmakuController 非空），
+    // 原来在 super.onClose() 之前就把它置空，导致 disposeDanmakuController() 恒为空操作
     super.onClose();
+    danmakuController = null;
   }
 }

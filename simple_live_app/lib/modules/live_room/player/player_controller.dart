@@ -19,6 +19,7 @@ import 'package:simple_live_app/app/controller/base_controller.dart';
 import 'package:simple_live_app/app/custom_throttle.dart';
 import 'package:simple_live_app/app/log.dart';
 import 'package:simple_live_app/app/utils.dart';
+import 'package:simple_live_app/app/window_state.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -271,8 +272,25 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
     await WakelockPlus.disable();
   }
 
+  /// 桌面端窗口操作串行队列。
+  /// window_manager 的全屏/尺寸/标题栏/置顶调用都是异步的，并且会相互影响；
+  /// 并发发出时会在窗口尺寸上竞争（例如 setFullScreen(false) 还没完成就又 setSize），
+  /// 造成窗口状态错乱、长时间无响应。
+  Future<void> _windowOpQueue = Future<void>.value();
+
+  Future<void> _windowOp(Future<void> Function() op) {
+    final next = _windowOpQueue.then((_) => op()).catchError((Object e) {
+      Log.logPrint("窗口操作失败：$e");
+    });
+    _windowOpQueue = next;
+    return next;
+  }
+
   /// 进入全屏
   void enterFullScreen() {
+    if (fullScreenState.value) {
+      return;
+    }
     fullScreenState.value = true;
     if (Platform.isAndroid || Platform.isIOS) {
       //全屏
@@ -282,23 +300,51 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
         setLandscapeOrientation();
       }
     } else {
-      windowManager.setFullScreen(true);
+      // 不再先 isFullScreen() 查询：那是一次跨进程方法通道调用，
+      // 在 Windows 上曾导致进程直接崩溃（见 window_state.dart 说明）。
+      // setFullScreen 本身是幂等的，重复设置同一状态无副作用。
+      AppWindowState.markFullScreen(true);
+      _windowOp(() async {
+        await windowManager.setFullScreen(true);
+      });
     }
     //danmakuController?.clear();
   }
 
   /// 退出全屏
   void exitFull() {
+    if (!fullScreenState.value) {
+      return;
+    }
+    fullScreenState.value = false;
     if (Platform.isAndroid || Platform.isIOS) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge,
           overlays: SystemUiOverlay.values);
       setPortraitOrientation();
     } else {
-      windowManager.setFullScreen(false);
+      AppWindowState.markFullScreen(false);
+      _windowOp(() async {
+        await windowManager.setFullScreen(false);
+      });
     }
-    fullScreenState.value = false;
 
     //danmakuController?.clear();
+  }
+
+  /// 返回（返回箭头 / 后台返回键 / 鼠标侧键）的统一处理。
+  /// 沉浸态下先退出小窗或全屏并消费本次返回，返回 true 表示不需要再执行 Get.back()。
+  /// 之前小窗模式复用了 fullScreenState，但没有区分小窗与全屏，
+  /// 导致小窗下按返回会去调用 exitFull，窗口停留在小窗状态无法恢复。
+  bool exitImmersive() {
+    if (smallWindowState.value) {
+      exitSmallWindow();
+      return true;
+    }
+    if (fullScreenState.value) {
+      exitFull();
+      return true;
+    }
+    return false;
   }
 
   Size? _lastWindowSize;
@@ -306,43 +352,98 @@ mixin PlayerSystemMixin on PlayerMixin, PlayerStateMixin, PlayerDanmakuMixin {
 
   ///小窗模式()
   void enterSmallWindow() async {
-    if (!(Platform.isAndroid || Platform.isIOS)) {
-      fullScreenState.value = true;
-      smallWindowState.value = true;
+    if (Platform.isAndroid || Platform.isIOS) {
+      return;
+    }
+    if (smallWindowState.value) {
+      // 重复进入会覆盖已保存的窗口尺寸，导致退出小窗时恢复不回去
+      return;
+    }
 
-      // 读取窗口大小
-      _lastWindowSize = await windowManager.getSize();
-      _lastWindowPosition = await windowManager.getPosition();
+    // 先读取窗口状态，成功之后再切换状态：
+    // 原来先置位再 await，await 失败或期间退出直播间会让状态与真实窗口不一致
+    final size = await windowManager.getSize();
+    final position = await windowManager.getPosition();
+    _lastWindowSize = size;
+    _lastWindowPosition = position;
 
-      windowManager.setTitleBarStyle(TitleBarStyle.hidden);
-      // 获取视频窗口大小
-      var width = player.state.width ?? 16;
-      var height = player.state.height ?? 9;
+    fullScreenState.value = true;
+    smallWindowState.value = true;
 
+    // 获取视频窗口大小
+    var width = player.state.width ?? 16;
+    var height = player.state.height ?? 9;
+
+    await _windowOp(() async {
+      await windowManager.setTitleBarStyle(TitleBarStyle.hidden);
       // 横屏还是竖屏
       if (height > width) {
         var aspectRatio = width / height;
-        windowManager.setSize(Size(400, 400 / aspectRatio));
+        await windowManager.setSize(Size(400, 400 / aspectRatio));
       } else {
         var aspectRatio = height / width;
-        windowManager.setSize(Size(280 / aspectRatio, 280));
+        await windowManager.setSize(Size(280 / aspectRatio, 280));
       }
-
-      windowManager.setAlwaysOnTop(true);
-    }
+      await windowManager.setAlwaysOnTop(true);
+    });
   }
 
   ///退出小窗模式()
   void exitSmallWindow() {
-    if (!(Platform.isAndroid || Platform.isIOS)) {
-      fullScreenState.value = false;
-      smallWindowState.value = false;
-      windowManager.setTitleBarStyle(TitleBarStyle.normal);
-      windowManager.setSize(_lastWindowSize!);
-      windowManager.setPosition(_lastWindowPosition!);
-      windowManager.setAlwaysOnTop(false);
-      //windowManager.setAlignment(Alignment.center);
+    if (Platform.isAndroid || Platform.isIOS) {
+      return;
     }
+    if (!smallWindowState.value) {
+      return;
+    }
+    fullScreenState.value = false;
+    smallWindowState.value = false;
+
+    // 之前这里用 _lastWindowSize!/_lastWindowPosition! 强制解包：
+    // 只要 getSize/getPosition 还没返回或抛错，这里就会抛异常，
+    // 而后面的 setPosition/setAlwaysOnTop(false) 会被整体跳过，
+    // 窗口就被永久留在「无边框 + 置顶 + 280x280」的状态。
+    final size = _lastWindowSize ?? const Size(1280, 720);
+    final position = _lastWindowPosition;
+    _windowOp(() async {
+      await windowManager.setTitleBarStyle(TitleBarStyle.normal);
+      await windowManager.setSize(size);
+      if (position != null) {
+        await windowManager.setPosition(position);
+      }
+      await windowManager.setAlwaysOnTop(false);
+    });
+  }
+
+  /// 退出直播间时恢复桌面端窗口状态。
+  /// 原实现只在 smallWindowState 为 true 时恢复，且不处理全屏、不等待平台调用；
+  /// 于是返回后窗口会残留为全屏 / 无边框 / 置顶，表现上就像卡住了。
+  void restoreWindowState() {
+    if (Platform.isAndroid || Platform.isIOS) {
+      return;
+    }
+    final wasSmall = smallWindowState.value;
+    // 用 Dart 侧记录的全屏状态，避免再向窗口管理器查询
+    final wasFullScreen = AppWindowState.isFullScreen;
+    smallWindowState.value = false;
+    fullScreenState.value = false;
+    AppWindowState.markFullScreen(false);
+
+    final size = _lastWindowSize ?? const Size(1280, 720);
+    final position = _lastWindowPosition;
+    _windowOp(() async {
+      if (wasSmall) {
+        await windowManager.setTitleBarStyle(TitleBarStyle.normal);
+        await windowManager.setSize(size);
+        if (position != null) {
+          await windowManager.setPosition(position);
+        }
+      }
+      if (wasFullScreen) {
+        await windowManager.setFullScreen(false);
+      }
+      await windowManager.setAlwaysOnTop(false);
+    });
   }
 
   /// 设置横屏
@@ -834,15 +935,47 @@ class PlayerController extends BaseController
   }
 
   @override
-  void onClose() async {
+  void onClose() {
     Log.w("播放器关闭");
-    if (smallWindowState.value) {
-      exitSmallWindow();
-    }
+    // 先恢复窗口状态，避免退出直播间后窗口停留在全屏 / 小窗 / 置顶状态
+    restoreWindowState();
+    // 自动隐藏控制器计时器必须取消，否则销毁后仍会回调
+    hideControlsTimer?.cancel();
     disposeStream();
     disposeDanmakuController();
-    await resetSystem();
-    await player.dispose();
     super.onClose();
+    // GetX 的 onClose 是同步的（返回 void），这里不能声明成 async：
+    // 那样 await 之后的代码会脱离销毁流程异步执行，与 Video 组件卸载的顺序完全不确定。
+    // 改为显式串成一条释放链，保证顺序正确、且任何一步失败都不会跳过 player.dispose()。
+    unawaited(_releasePlayer());
+  }
+
+  /// 释放播放资源。
+  /// 这里唯一必须保证的事情是 player.dispose() 一定要被执行到。
+  ///
+  /// 视频输出（含 mpv 渲染上下文）的释放不需要 App 自己处理：
+  /// media_kit_video 2.x 的 VideoController 没有 dispose()，原生控制器在创建时就把
+  /// 自己的释放回调注册到了 player.platform.release 上，由 Player.dispose() 负责调用
+  /// （见 media_kit_video/lib/src/video_controller/native_video_controller/real.dart:
+  ///    // Register [_dispose] for execution upon [Player.dispose].
+  ///    player.platform?.release.add(controller._dispose); ）。
+  ///
+  /// 原来的 onClose() 声明为 async，而 GetX 的 onClose 是 void：
+  /// 第一个 await（resetSystem）之后的代码全部脱离销毁流程执行，
+  /// 并且因为没有 try/catch，resetSystem() 一旦抛异常
+  /// （Windows 上 SystemChrome / WakelockPlus / ScreenBrightness 都可能没有实现），
+  /// player.dispose() 就被整段跳过 —— 每次退出直播间泄漏一个 libmpv 实例和一份原生
+  /// 视频输出，累积后表现为点击返回卡住数秒、随后进程消失。
+  Future<void> _releasePlayer() async {
+    try {
+      await resetSystem();
+    } catch (e) {
+      Log.logPrint("恢复系统状态失败：$e");
+    }
+    try {
+      await player.dispose();
+    } catch (e) {
+      Log.logPrint("释放播放器失败：$e");
+    }
   }
 }

@@ -89,8 +89,13 @@ class LiveRoomPage extends GetView<LiveRoomController> {
         if (controller.fullScreenState.value) {
           return PopScope(
             canPop: false,
-            onPopInvokedWithResult: (e, r) {
-              controller.exitFull();
+            onPopInvokedWithResult: (didPop, result) {
+              if (didPop) {
+                return;
+              }
+              // 小窗模式下必须退出小窗而不是退出全屏，
+              // 否则 smallWindowState 与真实窗口状态会不一致，窗口卡在小窗/置顶状态
+              controller.exitImmersive();
             },
             child: Scaffold(
               body: buildMediaPlayer(),

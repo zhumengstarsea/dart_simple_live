@@ -10653,17 +10653,21 @@ function getMSSDKSignature(msStub, userAgent) {
       memoryLimit: 4 * 1024 * 1024,
       maxStackSize: 64 * 1024,
     );
-    final msToken = generateMsToken(107);
-    var params = ('$url&msToken=$msToken').split('?')[1];
-    var query = params.contains("?") ? params.split("?")[1] : params;
-    var jsCode = kABogus;
-    flutterJs.eval(jsCode);
-    // 执行getABogus函数
-    var aBogus = flutterJs.eval("getABogus('$query', '$userAgent')");
-    flutterJs.dispose();
-    var newUrl =
-        '$url&msToken=${Uri.encodeComponent(msToken)}&a_bogus=${Uri.encodeComponent(aBogus)}';
-    return newUrl;
+    try {
+      final msToken = generateMsToken(107);
+      var params = ('$url&msToken=$msToken').split('?')[1];
+      var query = params.contains("?") ? params.split("?")[1] : params;
+      var jsCode = kABogus;
+      flutterJs.eval(jsCode);
+      // 执行getABogus函数
+      var aBogus = flutterJs.eval("getABogus('$query', '$userAgent')");
+      var newUrl =
+          '$url&msToken=${Uri.encodeComponent(msToken)}&a_bogus=${Uri.encodeComponent(aBogus)}';
+      return newUrl;
+    } finally {
+      // eval 抛异常时也必须释放 JS 引擎，否则会泄漏
+      flutterJs.dispose();
+    }
   }
 
   static String getSignature(String roomId, String uniqueId) {
@@ -10672,19 +10676,29 @@ function getMSSDKSignature(msStub, userAgent) {
       maxStackSize: 128 * 1024,
     );
 
-    flutterJs.eval(kWebMsSDK);
-    var msStub = getMsStub(roomId, uniqueId);
-    var signature = flutterJs.eval(
-      "getMSSDKSignature('$msStub','$defaultUserAgent')",
-    );
-    // 如果signature中包含-或=，重新生成
-    while (signature.contains('-') || signature.contains('=')) {
-      signature = flutterJs.eval(
+    try {
+      flutterJs.eval(kWebMsSDK);
+      var msStub = getMsStub(roomId, uniqueId);
+      var signature = flutterJs.eval(
         "getMSSDKSignature('$msStub','$defaultUserAgent')",
       );
+      // 如果signature中包含-或=，重新生成。
+      // 这里是在 UI isolate 上同步执行 JS，必须限制重试次数：
+      // 原来的 while 没有上限，只要 JS 一直返回含 - 或 = 的结果，
+      // UI 线程就会永远卡在这里（表现为界面完全不动、几秒后进程消失）。
+      for (var i = 0; i < 8; i++) {
+        if (!signature.contains('-') && !signature.contains('=')) {
+          break;
+        }
+        signature = flutterJs.eval(
+          "getMSSDKSignature('$msStub','$defaultUserAgent')",
+        );
+      }
+      return signature;
+    } finally {
+      // eval 抛异常时也必须释放 JS 引擎，否则会泄漏
+      flutterJs.dispose();
     }
-    flutterJs.dispose();
-    return signature;
   }
 
   static String getMsStub(String roomId, String uniqueId) {

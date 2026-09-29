@@ -60,8 +60,16 @@ class WebScoketUtils {
 
   StreamSubscription<dynamic>? streamSubscription;
 
+  /// 连接代次，close() 时自增。
+  /// connect() 中的 `await webSocket?.ready` 无法取消：如果连接还没建立用户就退出了
+  /// 直播间，await 之后仍会执行 ready()，从而回调 onReady 并启动心跳定时器，
+  /// 而 close() 早已跑完，这些定时器与连接再也没有人能取消。
+  int _generation = 0;
+
   void connect({bool retry = false}) async {
     close();
+    // close() 之后取一次代次，用于判断 await 期间是否又被关闭过
+    final generation = _generation;
     try {
       var wsurl = url;
       if (backupUrl != null && backupUrl!.isNotEmpty && retry) {
@@ -74,8 +82,16 @@ class WebScoketUtils {
       );
 
       await webSocket?.ready;
+      // 连接期间已经被关闭，放弃这次连接，不再回调也不再建立心跳
+      if (generation != _generation) {
+        webSocket?.sink.close();
+        return;
+      }
       ready();
     } catch (e) {
+      if (generation != _generation) {
+        return;
+      }
       if (!retry) {
         connect(retry: true);
         return;
@@ -86,6 +102,9 @@ class WebScoketUtils {
 
   /// 连接完成
   void ready() {
+    // 注意：这里不能判断 status 是否为 closed，
+    // 因为 connect() 开头就调用了 close()，连接成功时代次未变但 status 仍是 closed。
+    // 是否已被关闭由 connect() 里的代次校验负责。
     status = SocketStatus.connected;
 
     streamSubscription = webSocket?.stream.listen(
@@ -99,6 +118,8 @@ class WebScoketUtils {
   }
 
   void initHeartBeat() {
+    // 先取消上一个心跳，避免引用被覆盖后留下无法取消的定时器
+    heartBeatTimer?.cancel();
     heartBeatTimer = Timer.periodic(
       Duration(milliseconds: heartBeatTime),
       (timer) {
@@ -133,6 +154,8 @@ class WebScoketUtils {
   }
 
   void close() {
+    // 自增代次，令仍在 await 中的 connect() 失效
+    _generation++;
     status = SocketStatus.closed;
 
     streamSubscription?.cancel();

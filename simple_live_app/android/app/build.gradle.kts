@@ -54,8 +54,12 @@ android {
 
     buildTypes {
         release {
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            // 有 key.properties 就用正式签名，没有就退回 debug 签名，
+            // 这样没有密钥的环境（例如临时验证构建）也能产出可安装的 APK。
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
             }
             isMinifyEnabled = true
             isShrinkResources = true

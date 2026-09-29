@@ -19,6 +19,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   flutter::DartProject project(L"data");
 
+  // Flutter 3.47's Impeller snapshot path can resolve a live video texture
+  // through Skia with a null GrDirectContext during route transitions.
+  // Select Skia through the embedding API so this also applies to release
+  // builds (FLUTTER_ENGINE_SWITCH_* is ignored in release mode).
+  // https://github.com/flutter/flutter/issues/190774
+  project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);
+
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
 
